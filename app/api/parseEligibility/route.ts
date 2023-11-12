@@ -2,7 +2,16 @@ import { NextResponse, type NextRequest } from 'next/server'
 import https from 'https'
 import path from 'path'
 import fs from 'fs'
-import { OpenAI } from 'openai'
+import { BadRequestError, OpenAI } from 'openai'
+import { kv } from '@vercel/kv'
+import { Ratelimit } from '@upstash/ratelimit'
+
+type OpenAIErrorObj = {
+  message?: string
+  code?: string
+  param?: string
+  type?: string
+}
 
 export const POST = async (request: NextRequest): Promise<NextResponse> => {
   if (!request.body) return NextResponse.json('No request body provided.')
@@ -11,37 +20,89 @@ export const POST = async (request: NextRequest): Promise<NextResponse> => {
   const pdfLink = reqBody.pdfLink
   if (!pdfLink) return NextResponse.json('No pdf URL provided.')
 
+  const userIP = request.headers.get('x-forwarded-for')
+  const rateLimited = await isIPRateLimited(userIP)
+  if (rateLimited) {
+    return NextResponse.json({
+      code: 'rate_limit_exceeded',
+      errorMsg: 'Rate limit exceeded.' 
+    }, 
+    { status: 429 })
+  }
+
   const openAI = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
   })
 
-  const fileID = await uploadFileToOpenAI(pdfLink, 'grant.pdf', openAI)
-  if (!fileID) return NextResponse.json('Upload to OpenAI failed.')
+  let filePath
+  try {
+    filePath = await downloadFile(pdfLink, 'grant.pdf')
+  } catch (err) {
+    if (err instanceof TypeError) {
+      if (err.message === 'Invalid URL') {
+        return NextResponse.json({
+          code: 'invalid_pdf_url',
+          errorMsg: 'Invalid PDF URL.' 
+        }, 
+        { status: 400 })
+      }
+    }
+  }
 
-  const assistant = await openAI.beta.assistants.create({
-    name: 'Eligibility creator',
-    description:
-        'Parses the eligibility from a grant PDF into a ' +
-        'structured format.',
-    instructions:
-        'You are an expert grant consultant hired to ' +
-        'parse the eligibility criteria of a grant into a structured ' +
-        'format. You will be given a grant PDF and asked to find the ' +
-        'attributes that an organization must have and not have to ' +
-        'qualify for the grant. You will also be asked to identify the ' +
-        'types of organizations that are eligible to be the prime ' +
-        'applicant and the types of organizations that are eligible to ' +
-        'be a sub applicant.',
-    model: 'gpt-4-1106-preview',
-    tools: [
-        { type: 'retrieval' },
-        {
-            type: 'function',
-            function: checkEligibilityFunction,
-        },
-    ],
-    file_ids: [fileID],
+   if (!filePath) return NextResponse.json('Upload to OpenAI failed.')
+
+  const file = await openAI.files.create({
+    file: fs.createReadStream(filePath),
+    purpose: 'assistants',
   })
+
+
+  // Clean up: delete local file after uploading to OpenAI.
+  deleteFile(filePath)
+
+  let assistant
+  try {
+    assistant = await openAI.beta.assistants.create({
+      name: 'Eligibility creator',
+      description:
+          'Parses the eligibility from a grant PDF into a ' +
+          'structured format.',
+      instructions:
+          'You are an expert grant consultant hired to ' +
+          'parse the eligibility criteria of a grant into a structured ' +
+          'format. You will be given a grant PDF and asked to find the ' +
+          'attributes that an organization must have and not have to ' +
+          'qualify for the grant. You will also be asked to identify the ' +
+          'types of organizations that are eligible to be the prime ' +
+          'applicant and the types of organizations that are eligible to ' +
+          'be a sub applicant.',
+      model: 'gpt-4-1106-preview',
+      tools: [
+          { type: 'retrieval' },
+          {
+              type: 'function',
+              function: checkEligibilityFunction,
+          },
+      ],
+      file_ids: [file.id],
+    })
+  } catch (err) {
+    if (err instanceof BadRequestError) {
+      // Type gymnastics to make error message type-compliant.
+      const openAIError = err.error as OpenAIErrorObj
+      const errorMsg = openAIError.message
+      // TODO(@EricHasegawa): Make this less fragile.
+      if (errorMsg?.startsWith('Failed to index file: Unsupported file')) {
+        return NextResponse.json({
+          code: 'unsupported_file_type',
+          errorMsg: 'Unsupported file type.' 
+        }, 
+        { status: 400 })
+      }
+    }
+  }
+
+  if (!assistant) return NextResponse.json('Assistant creation failed.')
 
   const thread = await openAI.beta.threads.create({
     messages: [
@@ -62,7 +123,7 @@ export const POST = async (request: NextRequest): Promise<NextResponse> => {
                 'Parse it out of the overall document and MAKE SURE you ' +
                 'Return it according to the format in the ' +
                 'checkEligibility function.',
-            file_ids: [fileID],
+            file_ids: [file.id],
         },
     ],
   })
@@ -83,13 +144,13 @@ export const POST = async (request: NextRequest): Promise<NextResponse> => {
   }
 
   // Clean up: delete file and assistant.
-  await openAI.files.del(fileID)
+  await openAI.files.del(file.id)
   await openAI.beta.assistants.del(assistant.id)
 
   if (runResults.status === 'failed') {
       if (runResults.last_error?.code === 'rate_limit_exceeded') {
           return NextResponse.json({
-            code: 'rate_limit_exceeded',
+            code: 'openai_rate_limit_exceeded',
             errorMsg: 'OpenAI API rate limit exceeded.' 
           }, 
           { status: 429 })
@@ -124,7 +185,26 @@ export const POST = async (request: NextRequest): Promise<NextResponse> => {
   }
 
   const toolCalls = requiredAction.submit_tool_outputs.tool_calls
-  return NextResponse.json({criteria: toolCalls}, { status: 200 })
+  const criteriaCall = toolCalls[0]
+  return NextResponse.json({criteria: criteriaCall}, { status: 200 })
+}
+
+const isIPRateLimited = async (ip: string | null): Promise<boolean> => {
+  if (!ip) return false
+
+  if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
+    const ratelimit = new Ratelimit({
+      redis: kv,
+      // rate limit to 5 requests per 10 seconds
+      limiter: Ratelimit.slidingWindow(3, '60s')
+    })
+
+    const { success } = await ratelimit.limit(
+      `ratelimit_${ip}`
+    )
+    return !success
+  }
+  return false
 }
 
 const checkEligibilityFunction = {
@@ -187,25 +267,6 @@ const checkEligibilityFunction = {
   },
 }
 
-const uploadFileToOpenAI = async (
-  fileUrl: string,
-  fileName: string, // Must include extension.
-  openAI: OpenAI,
-): Promise<string | undefined> => {
-  const filePath = await downloadFile(fileUrl, fileName)
-  if (!filePath) return
-
-  const file = await openAI.files.create({
-      file: fs.createReadStream(filePath),
-      purpose: 'assistants',
-  })
-
-  const deleteResult = deleteFile(filePath)
-  if (!deleteResult) return
-
-  return file.id
-}
-
 // Downloads a file directly to "servers" /tmp directory.
 const downloadFile = async (
   grantUrl: string,
@@ -224,6 +285,7 @@ const downloadFile = async (
           })
           filePath.on('error', (err) => {
               fs.unlink(pathName, () => {
+                  console.log('error!!!' + err)
                   reject(err)
               })
           })

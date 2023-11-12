@@ -1,3 +1,5 @@
+export const maxDuration = 300
+
 import { NextResponse, type NextRequest } from 'next/server'
 import https from 'https'
 import path from 'path'

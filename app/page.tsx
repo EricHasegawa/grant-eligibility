@@ -64,7 +64,6 @@ export default function Home() {
     const eligibility = JSONCriteria.eligibility
     const prettyCriteria = JSON.stringify(eligibility, null, 2)
     setResult(prettyCriteria)
-
   }, [isLoading, pdfLink])
 
   const copyToClipboard = useCallback(() => {
